@@ -1,0 +1,170 @@
+{
+  "Comment": "Claim the expired lease, send OFF, wait 60 seconds, send ON, then disarm.",
+  "StartAt": "ClaimLease",
+  "States": {
+    "ClaimLease": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ControllerArn}",
+        "Payload": {
+          "action": "claim",
+          "version.$": "$.version"
+        }
+      },
+      "ResultPath": "$.claim",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "BackoffRate": 2,
+          "MaxAttempts": 3
+        }
+      ],
+      "Next": "Claimed?"
+    },
+    "Claimed?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.claim.Payload.claimed",
+          "BooleanEquals": true,
+          "Next": "TurnOff"
+        }
+      ],
+      "Default": "NotExpired"
+    },
+    "NotExpired": {
+      "Type": "Succeed"
+    },
+    "TurnOff": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PowerArn}",
+        "Payload": {
+          "action": "off"
+        }
+      },
+      "ResultPath": "$.off",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 3,
+          "BackoffRate": 2,
+          "MaxAttempts": 3
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.off_error",
+          "Next": "WaitOneMinute"
+        }
+      ],
+      "Next": "WaitOneMinute"
+    },
+    "WaitOneMinute": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "TurnOn"
+    },
+    "TurnOn": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PowerArn}",
+        "Payload": {
+          "action": "on"
+        }
+      },
+      "ResultPath": "$.on",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 3,
+          "BackoffRate": 2,
+          "MaxAttempts": 8
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.on_error",
+          "Next": "MarkError"
+        }
+      ],
+      "Next": "OffCommandSucceeded?"
+    },
+    "MarkFinished": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ControllerArn}",
+        "Payload": {
+          "action": "finish",
+          "version.$": "$.version"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "BackoffRate": 2,
+          "MaxAttempts": 3
+        }
+      ],
+      "End": true
+    },
+    "MarkError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ControllerArn}",
+        "Payload": {
+          "action": "fail",
+          "version.$": "$.version"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "BackoffRate": 2,
+          "MaxAttempts": 3
+        }
+      ],
+      "Next": "CycleFailed"
+    },
+    "OffCommandSucceeded?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.off_error",
+          "IsPresent": true,
+          "Next": "MarkError"
+        }
+      ],
+      "Default": "MarkFinished"
+    },
+    "CycleFailed": {
+      "Type": "Fail",
+      "Error": "CycleFailed",
+      "Cause": "OFF or ON cloud command failed; physical state must be checked."
+    }
+  }
+}

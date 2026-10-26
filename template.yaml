@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Altera firesim port remote KP100 four-hour renewable watchdog
+
+Parameters:
+  KasaSecretArn:
+    Type: String
+    Description: ARN of Secrets Manager JSON secret containing username and password
+  KasaDeviceAlias:
+    Type: String
+    Description: Exact alias of plug in Kasa app, e.g. Altera firesim port Power
+  DeviceKey:
+    Type: String
+    Default: kp100
+    MinLength: 1
+    MaxLength: 40
+    AllowedPattern: '[A-Za-z0-9_-]+'
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional email for Step Functions execution-failure alarm (subscription must be confirmed)
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+  LeaseTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+
+  HeartbeatFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/heartbeat/
+      Handler: app.lambda_handler
+      Runtime: python3.14
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref LeaseTable
+          DEVICE_KEY: !Ref DeviceKey
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt LeaseTable.Arn
+
+  CheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/controller/
+      Handler: app.lambda_handler
+      Runtime: python3.14
+      Timeout: 15
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref LeaseTable
+          DEVICE_KEY: !Ref DeviceKey
+          MACHINE_ARN: !Sub arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-cycle
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt LeaseTable.Arn
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Sub arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-cycle
+      Events:
+        EveryMinute:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(1 minute)
+            FlexibleTimeWindow:
+              Mode: 'OFF'
+            Input: '{"action":"check"}'
+            RetryPolicy:
+              MaximumRetryAttempts: 3
+              MaximumEventAgeInSeconds: 300
+
+  PowerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/power/
+      Handler: app.lambda_handler
+      Runtime: python3.14
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref KasaSecretArn
+          DEVICE_ALIAS: !Ref KasaDeviceAlias
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref KasaSecretArn
+
+  PowerCycleStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Type: STANDARD
+      Name: !Sub ${AWS::StackName}-cycle
+      DefinitionUri: statemachine/cycle.asl.json
+      DefinitionSubstitutions:
+        ControllerArn: !GetAtt CheckFunction.Arn
+        PowerArn: !GetAtt PowerFunction.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CheckFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PowerFunction
+
+  FailureTopic:
+    Type: AWS::SNS::Topic
+
+  FailureSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+      TopicArn: !Ref FailureTopic
+
+  PowerCycleFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alert when the watchdog power cycle execution fails
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref PowerCycleStateMachine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FailureTopic
+
+Outputs:
+  HeartbeatFunctionName:
+    Value: !Ref HeartbeatFunction
+  HeartbeatFunctionArn:
+    Value: !GetAtt HeartbeatFunction.Arn
+  LeaseTableName:
+    Value: !Ref LeaseTable
+  PowerCycleStateMachineArn:
+    Value: !Ref PowerCycleStateMachine
+  FailureTopicArn:
+    Value: !Ref FailureTopic
